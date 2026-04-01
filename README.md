@@ -1,30 +1,142 @@
-# Raspberry Pi Restore Guide (.ddz / .dd.gz)
+# pi-backups-recovery
 
-This repository contains (or references) compressed `dd` images created via `raspiBackup`. These images are "bare-metal" clones, meaning they include the partition table, bootloader, and all OS data.
-
-## 🗂 Preparation
-- **Target Drive:** Must be the same size or larger than the original source disk.
-- **File Format:** `.dd.gz` (often referred to as `ddz`).
+Bare-metal backup and recovery for Raspberry Pi using [`raspiBackup`](https://github.com/framps/raspiBackup). Creates compressed `dd` images (`.dd.gz` / `.ddz`) that include the partition table, bootloader, and all OS data — fully restorable to any same-size or larger drive.
 
 ---
 
-## 🍎 Method 1: Using macOS (Recommended)
-The easiest way to restore a compressed image is using a GUI flasher that handles decompression on the fly.
+## Repository Contents
 
-1. **Connect your SSD/SD Card** to your Mac using a USB enclosure or adapter.
-2. **Open Raspberry Pi Imager** (or BalenaEtcher).
-3. **Choose OS:** Scroll to the bottom and select **"Use Custom"**.
-4. **Select File:** Browse to your `.dd.gz` backup file.
-5. **Choose Storage:** Select your target SSD/SD card.
-6. **Write:** Wait for the process to complete and verify.
+| File | Purpose |
+|------|---------|
+| `raspiBackup.conf` | Sanitized raspiBackup configuration (no secrets) |
+| `raspiBackup-install.sh` | One-liner installer for raspiBackup |
+| `RESTORE.md` | Full restore guide (macOS, Linux, Pi) |
 
 ---
 
-## 🥧 Method 2: Using a Raspberry Pi (Terminal)
-If you are running the restore from a live Raspberry Pi (booted from a separate SD card), use the `raspiBackup` script.
+## Backup Overview
 
-### 1. Identify the target disk
-Connect your new SSD to the Pi and run:
+This setup uses `raspiBackup` in `dd` mode with gzip compression (`ddz`), storing backups on a NAS mount. Docker and other services are stopped cleanly before the image is taken and restarted after.
+
+### Backup type
+
+| Setting | Value |
+|---------|-------|
+| Type | `dd` (bit-for-bit image) |
+| Compression | gzip (`.dd.gz`) |
+| Retention | 3 backups kept |
+| Destination | NAS mount (e.g. `/mnt/nas_backups`) |
+
+### What gets backed up
+
+A `dd` backup captures the **entire SD card or SSD** — partition table, boot partition, root filesystem, and all data. It is a complete clone, not a file-level backup.
+
+---
+
+## Quick Start
+
+### 0. Clone the Repository
+Clone this repo to your Raspberry Pi to access the configuration templates and installation scripts.
+
 ```bash
-lsblk
+git clone git@github.com:KDN-Cloud/pi-backups-recovery.git
+cd pi-backups-recovery
+```
 
+> **Note:** If you already have a setup for your repositories, you can clone directly into your current directory. Otherwise, use the automated setup below:
+
+```bash
+mkdir -p ~/projects && cd ~/projects && \
+git clone https://github.com/KDN-Cloud/pi-backups-recovery.git && \
+cd pi-backups-recovery
+```
+
+### 1. Install raspiBackup
+
+```bash
+bash raspiBackup-install.sh
+```
+
+### 2. Configure
+
+```bash
+sudo cp raspiBackup.conf /usr/local/etc/raspiBackup.conf
+# Edit to set your backup path, notification tokens, and NAS mount
+sudo nano /usr/local/etc/raspiBackup.conf
+```
+
+### 3. Run a backup
+
+```bash
+sudo raspiBackup.sh
+```
+
+### 4. Schedule via cron
+
+```bash
+sudo crontab -e
+# Run every Sunday at 02:00
+0 2 * * 0 /usr/local/bin/raspiBackup.sh
+```
+
+---
+
+## Restore
+
+See **[RESTORE.md](RESTORE.md)** for full restore instructions across macOS, Linux, and Raspberry Pi.
+
+---
+
+## NAS Mount Setup
+
+raspiBackup writes to a mounted NAS share. Add to `/etc/fstab` for automatic mounting:
+
+```bash
+# NFS example
+192.168.x.x:/volume1/pi-backups  /mnt/nas_backups  nfs  defaults,_netdev  0  0
+
+# SMB/CIFS example
+//192.168.x.x/pi-backups  /mnt/nas_backups  cifs  credentials=/etc/nas-credentials,_netdev  0  0
+```
+
+```bash
+# /etc/nas-credentials (chmod 600, never commit)
+username=your_nas_user
+password=your_nas_password
+```
+
+Mount and verify before first backup:
+
+```bash
+sudo mount -a
+df -h /mnt/nas_backups
+```
+
+---
+
+## Service Stop / Start
+
+raspiBackup stops services before imaging and restarts them after to ensure a consistent snapshot:
+
+```bash
+# Stopped before backup
+systemctl stop docker
+systemctl stop cron
+systemctl stop containerd
+
+# Restarted after backup
+systemctl start containerd
+systemctl start cron
+systemctl start docker
+```
+
+Adjust `DEFAULT_STOPSERVICES` and `DEFAULT_STARTSERVICES` in `raspiBackup.conf` to match your setup.
+
+---
+
+## References
+
+- [raspiBackup GitHub](https://github.com/framps/raspiBackup)
+- [raspiBackup Documentation](https://www.linux-tips-and-tricks.de/en/raspberry-pi-backup/)
+- [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
+- [balenaEtcher](https://etcher.balena.io/)
