@@ -79,6 +79,11 @@ sudo crontab -e
 0 2 * * 0 /usr/local/bin/raspiBackup.sh
 ```
 
+# Run every day at 3am and ensure services are started up
+```bash
+00 03 * * * /usr/local/bin/raspiBackup.sh -m 0 ; /usr/bin/systemctl restart docker cron
+```
+
 ---
 
 ## Restore
@@ -91,11 +96,13 @@ See **[RESTORE.md](RESTORE.md)** for full restore instructions across macOS, Lin
 
 raspiBackup writes to a mounted NAS share. Add to `/etc/fstab` for automatic mounting:
 
-```bash
 # NFS example
-192.168.x.x:/volume1/pi-backups  /mnt/nas_backups  nfs  defaults,_netdev  0  0
+```bash
+192.168.1.x:/var/nfs/shared/RaspberryPi4  /mnt/unas_backups/  nfs  defaults,_netdev,x-systemd.automount,x-systemd.idle-timeout=600  0  0
+```
 
 # SMB/CIFS example
+```bash
 //192.168.x.x/pi-backups  /mnt/nas_backups  cifs  credentials=/etc/nas-credentials,_netdev  0  0
 ```
 
@@ -118,8 +125,8 @@ df -h /mnt/nas_backups
 
 raspiBackup stops services before imaging and restarts them after to ensure a consistent snapshot:
 
-```bash
 # Stopped before backup
+```bash
 systemctl stop docker
 systemctl stop cron
 systemctl stop containerd
