@@ -80,6 +80,7 @@ sudo crontab -e
 ```
 
 ```bash
+sudo crontab -e
 # Run every day at 3am and ensure services are started up
 00 03 * * * /usr/local/bin/raspiBackup.sh -m 0 ; /usr/bin/systemctl restart docker cron
 ```
