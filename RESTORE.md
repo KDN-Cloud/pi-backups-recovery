@@ -1,175 +1,80 @@
-# Restore Guide — raspiBackup `.dd.gz` Images
+# Restore the Raspberry Pi boot disk
 
-raspiBackup `dd` images are bare-metal clones — they include the partition table, bootloader, and all OS data. Restoring writes the entire image back to a target drive, byte for byte.
+The Pi's daily raspiBackup job writes full-disk `.img` files under `/mnt/unas_backups/raspberrypi/` on the UNAS NFS share. Sparse images read back as the full original disk, including the zero-filled regions. Use the image's logical size to size the replacement drive. Older backup directories can contain gzip-compressed disk images such as `.img.gz`.
 
----
+## Verify backup
 
-## Before You Start
+1. Mount the UNAS share on the recovery computer and select a completed backup directory. On the Pi, the mount point is `/mnt/unas_backups`.
+2. Check `raspiBackup.msg` for `Backup finished successfully` and confirm that the matching image is present. Review `raspiBackup.log` if the job reported errors.
+3. For a raw image, use `ls -lh` to read the logical size. On Linux, `fdisk -l /path/to/backup.img` can inspect the image's partition table. For a gzip image, run `gzip -t /path/to/backup.img.gz` to check the compressed data.
+4. Confirm the replacement drive has at least as many bytes as the original disk. The Pi's current SSD is 240,057,409,536 bytes. Compare exact sizes when using another drive with the same advertised capacity.
 
-- **Target drive** must be the **same size or larger** than the original source disk
-- **All data on the target drive will be erased**
-- Verify your backup file is not corrupt before restoring (see [Verify Backup](#verify-backup) below)
-- Know your target device path — **writing to the wrong device destroys data**
+If you have a saved checksum for the image, compare it before writing. A successful backup log and readable partition table are checks on the image. A boot from the restored drive verifies recovery.
 
----
+## Select the target disk
 
-## Method 1: macOS (Raspberry Pi Imager or balenaEtcher)
+**Writing an image erases the entire target drive.** Identify the replacement by its model and byte size before writing. On macOS use `diskutil list` and `diskutil info /dev/diskN`. On Linux use `lsblk -b -o NAME,SIZE,MODEL,TYPE,FSTYPE,MOUNTPOINTS`. Boot from separate media if using a Pi as the recovery computer.
 
-The simplest restore path — both tools decompress `.dd.gz` on the fly.
+The commands below use placeholder device names. Substitute the target's whole device, such as `/dev/sdb`, rather than a partition such as `/dev/sdb1`.
 
-1. Connect your target SSD or SD card via USB enclosure or adapter
-2. Open **Raspberry Pi Imager** or **balenaEtcher**
-3. In Raspberry Pi Imager:
-   - Click **Choose OS** → scroll to bottom → **Use custom**
-   - Select your `.dd.gz` backup file
-   - Click **Choose Storage** → select your target drive
-   - Click **Next** → **Write**
-4. In balenaEtcher:
-   - Click **Flash from file** → select your `.dd.gz` backup file
-   - Click **Select target** → select your target drive
-   - Click **Flash**
-5. Wait for write and verification to complete
+## Restore with Raspberry Pi Imager or balenaEtcher
 
-> Raspberry Pi Imager will verify the write automatically. In balenaEtcher, verification runs after flashing.
+In Raspberry Pi Imager, select **Use Custom** and choose the `.img` file. In balenaEtcher, use **Flash from file**. Confirm the replacement drive, write the image, and wait for verification. If using a compressed image with the GUI, extract it to a raw file first and allow enough free space for the entire original disk. [Raspberry Pi Imager documentation](https://www.raspberrypi.com/documentation/computers/getting-started.html)
 
----
+## Restore with macOS dd
 
-## Method 2: macOS Terminal (`dd`)
-
-For full control or scripted restores.
+After identifying the target, unmount it and write the raw image through its raw disk device.
 
 ```bash
-# identify your target disk (look for your drive size)
-diskutil list
-
-# unmount the target disk (replace diskN with your disk, e.g. disk4)
-diskutil unmountDisk /dev/diskN
-
-# restore — decompress and write in one pipeline
-# rdiskN (raw disk) is significantly faster than diskN on macOS
-gunzip -c /path/to/backup.dd.gz | sudo dd of=/dev/rdiskN bs=4m status=progress
-
-# eject when done
-diskutil eject /dev/diskN
+diskutil unmountDisk /dev/diskN &&
+    sudo dd if=/path/to/backup.img of=/dev/rdiskN bs=4m status=progress &&
+    sync &&
+    diskutil eject /dev/diskN
 ```
 
-> `bs=4m` (macOS syntax) sets the block size to 4MB for faster writes. On Linux use `bs=4M`.
+## Restore with Linux dd
 
----
-
-## Method 3: Linux Terminal (`dd`)
+Unmount any mounted partitions on the target, then write the raw image. Check the resulting partition table after the write succeeds.
 
 ```bash
-# identify your target disk
-lsblk
-# or
-fdisk -l
-
-# IMPORTANT: ensure the target disk is NOT mounted
-umount /dev/sdX*
-
-# restore — decompress and write in one pipeline
-gunzip -c /path/to/backup.dd.gz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
-
-# sync and verify
-sync
-lsblk /dev/sdX
+sudo dd if=/path/to/backup.img of=/dev/sdX bs=4M status=progress conv=fsync &&
+    sudo fdisk -l /dev/sdX
 ```
 
-> Replace `/dev/sdX` with your actual target device. Double-check with `lsblk` before running.
+Use ordinary writes when restoring to a disk. A sparse write option can skip zero blocks and leave old data on the target. The live backup command uses `conv=sparse` only for image creation. [GNU dd documentation](https://www.gnu.org/software/coreutils/manual/html_node/dd-invocation.html#dd-invocation)
 
----
+## Restore with raspiBackup on a separate Pi boot drive
 
-## Method 4: Raspberry Pi using raspiBackup
-
-If restoring to a new drive from a live Pi (booted from a separate SD card):
-
-### 1. Identify the target disk
-
-Connect the new drive and run:
+With the UNAS share mounted and the replacement disk connected, pass the whole target device and the completed **backup directory** to raspiBackup. For an older gzip backup, select its `ddz` directory.
 
 ```bash
-lsblk
+sudo raspiBackup.sh -d /dev/sdX /mnt/unas_backups/raspberrypi/NAME-OF-BACKUP-DIRECTORY
 ```
 
-Look for your target device (e.g. `/dev/sda` for USB SSD, `/dev/mmcblk0` for SD card).
+Review the device and backup details at the confirmation prompt. The normal restore settings apply, including `DEFAULT_RESIZE_ROOTFS=1` on the live Pi. [raspiBackup restore documentation](https://framps.github.io/raspiBackupDoc/restore-intro.html)
 
-### 2. Run the raspiBackup restore
+## Stream an older gzip image
+
+To restore a gzip image without staging a full raw file, first check it with `gzip -t`. After unmounting the target, run the appropriate command in Bash with `pipefail` so decompression errors fail the pipeline.
 
 ```bash
-sudo raspiBackup.sh -d /dev/sdX /path/to/backup/directory
+# macOS
+set -o pipefail
+gzip -dc /path/to/backup.img.gz | sudo dd of=/dev/rdiskN bs=4m status=progress
 ```
-
-raspiBackup will:
-- Detect the backup type automatically
-- Decompress and write the image
-- Optionally resize the root filesystem to fill the target drive
-
-### 3. Resize root filesystem (optional)
-
-If your target drive is larger than the original, raspiBackup can expand the root partition automatically. This is controlled by `DEFAULT_RESIZE_ROOTFS=1` in `raspiBackup.conf`.
-
-Alternatively, expand manually after booting from the restored drive:
 
 ```bash
-sudo raspi-config
-# → Advanced Options → Expand Filesystem
+# Linux
+set -o pipefail
+gzip -dc /path/to/backup.img.gz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
-Or manually with `parted` / `resize2fs`:
+After a successful macOS write, run `sync` and eject the disk. On Linux, inspect the target's partition table before booting it.
 
-```bash
-sudo parted /dev/sdX resizepart 2 100%
-sudo resize2fs /dev/sdX2
-```
+## After booting the restored Pi
 
----
-
-## Verify Backup
-
-Test the integrity of your `.dd.gz` file before restoring:
-
-```bash
-# test gzip integrity (no output = OK, error = corrupt)
-gunzip -t /path/to/backup.dd.gz
-
-# check file size is reasonable (should be several GB)
-ls -lh /path/to/backup.dd.gz
-
-# preview partition table from the compressed image without fully extracting
-gunzip -c /path/to/backup.dd.gz | sudo fdisk -l
-```
-
----
-
-## Post-Restore Checklist
-
-After writing the image and booting:
-
-- [ ] Pi boots successfully
-- [ ] SSH accessible
-- [ ] Hostname is correct (`hostnamectl`)
-- [ ] Docker containers running (`docker ps`)
-- [ ] NAS mount accessible (`df -h`)
-- [ ] Services healthy (`systemctl status`)
-- [ ] Run `sudo raspi-config` → Expand Filesystem if target drive is larger
-
----
-
-## Troubleshooting
-
-**Pi won't boot after restore**
-- Verify the write completed without errors
-- Check the target drive is not smaller than the original
-- Try re-flashing with Raspberry Pi Imager which verifies after writing
-
-**`dd` is slow**
-- Use `/dev/rdiskN` instead of `/dev/diskN` on macOS (raw disk, much faster)
-- Increase block size: `bs=4M` on Linux, `bs=4m` on macOS
-
-**"No space left on device" during restore**
-- Target drive is smaller than the original image — use a larger drive
-
-**Partition table looks wrong after restore**
-- Run `sudo parted /dev/sdX print` to inspect
-- The partition table is restored as-is from the original — resize after if needed
+- Confirm the Pi boots from the replacement drive and SSH works. Use `lsblk` to verify the boot and root filesystems are on the expected device.
+- Check Docker and the expected containers. Access `/mnt/unas_backups` and verify that it mounts as NFS.
+- If a larger target still has unallocated space after a raw write, expand the root filesystem through `sudo raspi-config` if needed.
+- Compare the restored root crontab with the daily 03:00 Pacific schedule in [README.md](README.md#schedule-and-service-downtime). An older image can carry the earlier backup schedule or alert setup.
+- Check the next backup's completion log and Telegram notice. Run the [failure email test](README.md#notifications-and-backup-checks) and confirm delivery to `Homelab/raspiBackup` in Fastmail.

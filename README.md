@@ -1,150 +1,92 @@
-# pi-backups-recovery
+# Pi backup and recovery
 
-Bare-metal backup and recovery for Raspberry Pi using [`raspiBackup`](https://github.com/framps/raspiBackup). Creates compressed `dd` images (`.dd.gz` / `.ddz`) that include the partition table, bootloader, and all OS data — fully restorable to any same-size or larger drive.
+The Raspberry Pi 4 uses [raspiBackup](https://github.com/framps/raspiBackup) to create full-disk images of its boot SSD on the UNAS. Each image includes the partition table, boot partition, and root filesystem. See [RESTORE.md](RESTORE.md) for recovery from the current raw images and older gzip images.
 
----
+| Setting | Live value |
+|---|---|
+| Schedule | Every day at 03:00 Pacific via root cron |
+| Format | Full-disk `dd` image (`.img`) with sparse writes |
+| Destination | UNAS NFS share mounted at `/mnt/unas_backups` |
+| Backup directories | `/mnt/unas_backups/raspberrypi/` |
+| Retention | Three `dd` backup sets |
+| Completion notices | Telegram for success and failure |
+| Failure email | Fastmail to `alerts@kf7.dev`, filed in `Homelab/raspiBackup` |
 
-## Repository Contents
+## Schedule and service downtime
 
-| File | Purpose |
-|------|---------|
-| `raspiBackup.conf` | Sanitized raspiBackup configuration (no secrets) |
-| `raspiBackup-install.sh` | One-liner installer for raspiBackup |
-| `RESTORE.md` | Full restore guide (macOS, Linux, Pi) |
+The root crontab contains one raspiBackup job. The separate `raspiBackup.timer` is disabled.
 
----
-
-## Backup Overview
-
-This setup uses `raspiBackup` in `dd` mode with gzip compression (`ddz`), storing backups on a NAS mount. Docker and other services are stopped cleanly before the image is taken and restarted after.
-
-### Backup type
-
-| Setting | Value |
-|---------|-------|
-| Type | `dd` (bit-for-bit image) |
-| Compression | gzip (`.dd.gz`) |
-| Retention | 3 backups kept |
-| Destination | NAS mount (e.g. `/mnt/nas_backups`) |
-
-### What gets backed up
-
-A `dd` backup captures the **entire SD card or SSD** — partition table, boot partition, root filesystem, and all data. It is a complete clone, not a file-level backup.
-
----
-
-## Quick Start
-
-### 0. Clone the Repository
-Clone this repo to your Raspberry Pi to access the configuration templates and installation scripts.
-
-```bash
-git clone git@github.com:KDN-Cloud/pi-backups-recovery.git
-cd pi-backups-recovery
+```cron
+00 03 * * * /usr/local/bin/raspiBackup.sh -m 0 -D conv=sparse || /usr/local/sbin/raspibackup-failure-mail "$?" ; /usr/bin/systemctl restart docker cron
 ```
 
-> **Note:** If you already have a setup for your repositories, you can clone directly into your current directory. Otherwise, use the automated setup below:
+The `-D conv=sparse` option skips writing zero-filled blocks to the NAS. The resulting image still has the original disk's logical size and contents. The option belongs on the backup command. Leave `DEFAULT_DD_PARMS` empty so a restore writes every block, including zeros. [GNU dd documentation](https://www.gnu.org/software/coreutils/manual/html_node/dd-invocation.html#dd-invocation)
+
+raspiBackup stops Docker, cron, and containerd before imaging and starts them in reverse order afterward. The cron command also restarts Docker and cron when the job finishes. Expect container downtime during the backup.
+
+## Notifications and backup checks
+
+raspiBackup uses `DEFAULT_TELEGRAM_NOTIFICATIONS="SF"` for Telegram completion notices. On a nonzero backup exit, the cron command calls `/usr/local/sbin/raspibackup-failure-mail` with the exit status. The hook uses a root-only Fastmail SMTP credential on the Pi and can send while Docker is down. Fastmail files `raspiBackup <notify@kf7.dev>` messages with the subject `[raspiBackup] Raspberry Pi backup failed` in `Homelab/raspiBackup`. [Notification routing](https://git.kf7.dev/ak/notification-routing)
+
+Each completed backup directory contains the image, `raspiBackup.msg`, and `raspiBackup.log`. Confirm that the latest scheduled directory has an image and that its message file says the backup finished successfully. Compare logical size and allocated space with `ls -lh` and `du -h` on the image.
+
+To send a clearly labeled failure email test without running a backup, use the same hook with its test flag and check the Fastmail folder.
 
 ```bash
-mkdir -p ~/projects && cd ~/projects && \
-git clone https://github.com/KDN-Cloud/pi-backups-recovery.git && \
-cd pi-backups-recovery
+sudo /usr/local/sbin/raspibackup-failure-mail 1 --test
 ```
 
-### 1. Install raspiBackup
+## Rebuilding the backup setup
+
+Use an SSH identity with access to Gitea if you need a fresh copy of the recovery repository. The installer helper sets up raspiBackup on a fresh Pi.
 
 ```bash
+git clone ssh://git@git.kf7.dev:222/ak/pi-backups-recovery.git
+cd pi-backups-recovery
 bash raspiBackup-install.sh
 ```
 
-### 2. Configure
+The sanitized `raspiBackup.conf` template enables gzip. When rebuilding the live setup, use these settings in `/usr/local/etc/raspiBackup.conf` and restore the Telegram credentials separately.
 
 ```bash
-sudo cp raspiBackup.conf /usr/local/etc/raspiBackup.conf
-# Edit to set your backup path, notification tokens, and NAS mount
-sudo nano /usr/local/etc/raspiBackup.conf
+DEFAULT_BACKUPPATH="/mnt/unas_backups"
+DEFAULT_BACKUPTYPE="dd"
+DEFAULT_ZIP_BACKUP="0"
+DEFAULT_KEEPBACKUPS="3"
+DEFAULT_SMART_RECYCLE="0"
+DEFAULT_DD_PARMS=""
+DEFAULT_EMAIL=""
+DEFAULT_TELEGRAM_NOTIFICATIONS="SF"
+DEFAULT_STOPSERVICES="systemctl stop docker && systemctl stop cron && systemctl stop containerd"
+DEFAULT_STARTSERVICES="systemctl start containerd && systemctl start cron && systemctl start docker"
 ```
 
-### 3. Run a backup
+The Pi mounts the share through `/etc/fstab` with a systemd automount. Substitute the UNAS host and export from your network setup when rebuilding the mount.
+
+```fstab
+UNAS_HOST:/path/to/export /mnt/unas_backups nfs vers=3,_netdev,x-systemd.automount,x-systemd.idle-timeout=600 0 0
+```
+
+Check that the path resolves to the NFS mount and that the failure hook and its credential file exist before installing the single cron entry above.
 
 ```bash
-sudo raspiBackup.sh
+ls /mnt/unas_backups
+findmnt -rn -t nfs,nfs4 -T /mnt/unas_backups
+sudo test -x /usr/local/sbin/raspibackup-failure-mail
+sudo test -s /etc/raspibackup-alerts/smtp-password
+sudo crontab -l
 ```
 
-### 4. Schedule via cron
+A full image taken after the alert setup includes the hook and its local configuration. When recovering from an older image or setting up a fresh Pi, restore the hook and its Fastmail credential from the secured deployment before relying on failure email.
+
+Use `sudo crontab -e` to install the single daily entry shown above. Once the cron entry is in place, disable the separate systemd timer if the installer enabled it.
 
 ```bash
-sudo crontab -e
-# Run every Sunday at 02:00
-0 2 * * 0 /usr/local/bin/raspiBackup.sh
+sudo systemctl disable --now raspiBackup.timer
 ```
+
+For a manual backup with the live image format, run the following during a maintenance window. The scheduled cron entry supplies the failure email hook.
 
 ```bash
-sudo crontab -e
-# Run every day at 3am and ensure services are started up
-00 03 * * * /usr/local/bin/raspiBackup.sh -m 0 ; /usr/bin/systemctl restart docker cron
+sudo /usr/local/bin/raspiBackup.sh -m 0 -D conv=sparse
 ```
-
----
-
-## Restore
-
-See **[RESTORE.md](RESTORE.md)** for full restore instructions across macOS, Linux, and Raspberry Pi.
-
----
-
-## NAS Mount Setup
-
-raspiBackup writes to a mounted NAS share. Add to `/etc/fstab` for automatic mounting:
-
-# NFS example
-```bash
-192.168.1.x:/var/nfs/shared/RaspberryPi4  /mnt/unas_backups/  nfs  defaults,_netdev,x-systemd.automount,x-systemd.idle-timeout=600  0  0
-```
-
-# SMB/CIFS example
-```bash
-//192.168.x.x/pi-backups  /mnt/nas_backups  cifs  credentials=/etc/nas-credentials,_netdev  0  0
-```
-
-```bash
-# /etc/nas-credentials (chmod 600, never commit)
-username=your_nas_user
-password=your_nas_password
-```
-
-Mount and verify before first backup:
-
-```bash
-sudo mount -a
-df -h /mnt/nas_backups
-```
-
----
-
-## Service Stop / Start
-
-raspiBackup stops services before imaging and restarts them after to ensure a consistent snapshot:
-
-# Stopped before backup
-```bash
-systemctl stop docker
-systemctl stop cron
-systemctl stop containerd
-
-# Restarted after backup
-systemctl start containerd
-systemctl start cron
-systemctl start docker
-```
-
-Adjust `DEFAULT_STOPSERVICES` and `DEFAULT_STARTSERVICES` in `raspiBackup.conf` to match your setup.
-
----
-
-## References
-
-- [raspiBackup GitHub](https://github.com/framps/raspiBackup)
-- [raspiBackup Documentation](https://www.linux-tips-and-tricks.de/en/raspberry-pi-backup/)
-- [Raspberry Pi Imager](https://www.raspberrypi.com/software/)
-- [balenaEtcher](https://etcher.balena.io/)
