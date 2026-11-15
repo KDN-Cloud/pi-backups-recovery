@@ -26,7 +26,7 @@ raspiBackup stops Docker, cron, and containerd before imaging and starts them in
 
 ## Notifications and backup checks
 
-raspiBackup uses `DEFAULT_TELEGRAM_NOTIFICATIONS="SF"` for Telegram completion notices. On a nonzero backup exit, the cron command calls `/usr/local/sbin/raspibackup-failure-mail` with the exit status. The hook uses a root-only Fastmail SMTP credential on the Pi and can send while Docker is down. Fastmail files `raspiBackup <notify@kf7.dev>` messages with the subject `[raspiBackup] Raspberry Pi backup failed` in `Homelab/raspiBackup`. [Notification routing](https://git.kf7.dev/ak/notification-routing)
+raspiBackup uses `DEFAULT_TELEGRAM_NOTIFICATIONS="SF"` for Telegram completion notices. On a nonzero backup exit, the cron command calls `/usr/local/sbin/raspibackup-failure-mail` with the exit status. The hook uses a root-only Fastmail SMTP credential on the Pi and can send while Docker is down. Fastmail files `raspiBackup <notify@kf7.dev>` messages with the subject `[raspiBackup] Raspberry Pi backup failed` in `Homelab/raspiBackup`. [Notification routing](https://git.kf7.dev/KDN-Home-Lab/notification-routing)
 
 Each completed backup directory contains the image, `raspiBackup.msg`, and `raspiBackup.log`. Confirm that the latest scheduled directory has an image and that its message file says the backup finished successfully. Compare logical size and allocated space with `ls -lh` and `du -h` on the image.
 
