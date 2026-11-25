@@ -1,0 +1,129 @@
+#!/usr/bin/python3
+"""Send the Pi backup service's final status to its configured Telegram chat."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+CONFIG_PATH = Path("/etc/raspibackup-alerts/telegram.json")
+PUBLISHED_PREFIX = "Verified backup published: /mnt/unas_backups/raspberrypi-online/"
+
+
+def load_config():
+    with os.fdopen(os.open(CONFIG_PATH, os.O_RDONLY | os.O_NOFOLLOW)) as file:
+        attrs = os.fstat(file.fileno())
+        if not stat.S_ISREG(attrs.st_mode) or attrs.st_uid != 0 or attrs.st_mode & 0o077:
+            raise ValueError("Telegram configuration must be a root-only regular file")
+        config = json.load(file)
+    if not isinstance(config, dict):
+        raise ValueError("Telegram configuration must be a JSON object")
+    token = config.get("token")
+    if not isinstance(token, str) or not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]+", token):
+        raise ValueError("Telegram configuration has an invalid token format")
+    chat_id = config.get("chat_id")
+    if type(chat_id) is not int and (
+        not isinstance(chat_id, str) or not re.fullmatch(r"-?[0-9]+|@[A-Za-z0-9_]+", chat_id)
+    ):
+        raise ValueError("Telegram configuration has an invalid chat_id")
+    thread_id = config.get("message_thread_id")
+    if thread_id is not None and (type(thread_id) is not int or thread_id <= 0):
+        raise ValueError("Telegram configuration has an invalid message_thread_id")
+    return token, chat_id, thread_id
+
+
+def telegram_request(token, method, data=None):
+    body = None if data is None else json.dumps(data).encode()
+    request = Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urlopen(request, timeout=10) as reply:
+            result = json.load(reply)
+    except HTTPError as error:
+        raise RuntimeError(f"Telegram API returned HTTP {error.code}") from None
+    except (URLError, TimeoutError, OSError, ValueError):
+        raise RuntimeError("Telegram API request failed") from None
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError("Telegram API did not accept the request")
+
+
+def published_archive():
+    invocation = os.environ.get("INVOCATION_ID", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+        return None
+    try:
+        journal = subprocess.run(
+            ["journalctl", "--no-pager", "-o", "cat", f"_SYSTEMD_INVOCATION_ID={invocation}"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    for line in reversed(journal.stdout.splitlines()):
+        if line.startswith(PUBLISHED_PREFIX):
+            name = line.removeprefix(PUBLISHED_PREFIX)
+            if re.fullmatch(r"online-[0-9]{8}-[0-9]{6}", name):
+                return name
+    return None
+
+
+def backup_message():
+    result = os.environ.get("SERVICE_RESULT")
+    if not result:
+        raise ValueError("Start this report through raspiBackup.service or use --test")
+    if result == "success":
+        message = "[raspiBackup] Raspberry Pi backup completed and verified on the UNAS."
+        archive = published_archive()
+        if archive:
+            message += f"\nArchive: {archive}"
+        return message
+    exit_status = os.environ.get("EXIT_STATUS")
+    details = result if not exit_status else f"{result}, status {exit_status}"
+    return (
+        f"[raspiBackup] Raspberry Pi backup failed ({details}).\n"
+        "Check journalctl -u raspiBackup.service on the Pi."
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    choices = parser.add_mutually_exclusive_group()
+    choices.add_argument("--check", action="store_true", help="verify the bot token without sending")
+    choices.add_argument("--test", action="store_true", help="send a labeled delivery test")
+    args = parser.parse_args()
+
+    try:
+        token, chat_id, thread_id = load_config()
+        if args.check:
+            telegram_request(token, "getMe")
+            print("Telegram accepted the bot token")
+            return 0
+        message = "[raspiBackup] Raspberry Pi Telegram delivery test." if args.test else backup_message()
+        data = {"chat_id": chat_id, "text": message}
+        if thread_id is not None:
+            data["message_thread_id"] = thread_id
+        telegram_request(token, "sendMessage", data)
+    except (OSError, ValueError, RuntimeError) as error:
+        reason = "could not read the Telegram configuration" if isinstance(error, OSError) else error
+        if isinstance(error, json.JSONDecodeError):
+            reason = "Telegram configuration is not valid JSON"
+        print(f"raspiBackup Telegram report: {reason}", file=sys.stderr)
+        return 1
+    print("Telegram accepted the raspiBackup report")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

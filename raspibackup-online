@@ -1,0 +1,217 @@
+#!/bin/bash
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+unas=/mnt/unas_backups
+# Set this to the exact NFS source reported by findmnt on the Pi.
+expected_export='UNAS_HOST:/path/to/export'
+cache=/var/cache/raspibackup-online
+config=/usr/local/etc/raspibackup-online.conf
+postgres_data=/home/pi/vikunja/db
+kuma_data=/home/pi/uptime-kuma/data/mariadb
+crowdsec_db=/home/pi/crowdsec/data/crowdsec.db
+pending=
+work=
+
+log() {
+    printf '%s\n' "$*"
+}
+
+fail() {
+    log "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    local result=$?
+    trap - EXIT
+    if [[ -n $work ]]; then
+        rm -rf -- "$work" || true
+    fi
+    if [[ -n $pending ]]; then
+        rm -rf -- "$pending" || true
+    fi
+    exit "$result"
+}
+
+[[ $# -eq 0 ]] || fail "Usage: raspibackup-online"
+exec 9>/run/lock/raspibackup-online.lock
+flock -n 9 || fail "An online backup is already running"
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+# Enter the mounted export before creating paths. The working directory keeps the mount pinned.
+timeout 15s stat "$unas/." >/dev/null
+[[ $(findmnt -rn -M "$unas" -t nfs,nfs4 -o SOURCE) == "$expected_export" ]] ||
+    fail "Expected UNAS NFS export is unavailable"
+cd "$unas"
+install -d -m 0700 raspberrypi-online
+cd raspberrypi-online
+
+install -d -m 0700 "$cache"
+work=$(mktemp -d "$cache/run.XXXXXXXX")
+install -d -m 0700 "$work/raspi" "$work/postgres" "$work/mariadb"
+
+log "Capturing and verifying the running Vikunja PostgreSQL cluster"
+docker exec -i -u postgres vikunja_db timeout 12m bash -s <<'POSTGRES' |
+set -Eeuo pipefail
+stage=$(mktemp -d /tmp/raspibackup-postgres.XXXXXXXX)
+trap 'rm -rf -- "$stage"' EXIT
+trap 'exit 143' TERM
+pg_basebackup --no-password --username="${POSTGRES_USER:?}" --pgdata="$stage" --checkpoint=fast --wal-method=stream >&2
+pg_verifybackup "$stage" >&2
+tar --numeric-owner -C "$stage" -cpf - .
+POSTGRES
+tar --numeric-owner --same-permissions -C "$work/postgres" -xpf -
+chown --reference="$postgres_data" "$work/postgres"
+chmod --reference="$postgres_data" "$work/postgres"
+
+log "Capturing Uptime Kuma and restoring its dump into a private MariaDB instance"
+docker exec -i -u root Uptime-Kuma timeout 15m bash -s <<'MARIADB' |
+set -Eeuo pipefail
+stage=$(mktemp -d /tmp/raspibackup-mariadb.XXXXXXXX)
+server_pid=
+cleanup() {
+    if [[ -n $server_pid ]]; then
+        kill "$server_pid" 2>/dev/null || true
+        wait "$server_pid" || true
+    fi
+    rm -rf -- "$stage"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+live=/app/data/run/mariadb.sock
+# Host root owns the outer directory. The database user can traverse to its private subdirectory.
+chmod 0711 "$stage"
+install -d -m 0700 -o node -g node "$stage/db"
+mariadb-install-db --no-defaults --datadir="$stage/db" --user=node \
+    --auth-root-authentication-method=socket --skip-test-db >"$stage/init.log" 2>&1 ||
+    { tail -n 20 "$stage/init.log" >&2; exit 1; }
+copy="$stage/db/copy.sock"
+mariadbd --no-defaults --user=node --datadir="$stage/db" --socket="$copy" \
+    --pid-file="$stage/db/copy.pid" --skip-networking --skip-log-bin --skip-slave-start \
+    --event-scheduler=OFF --innodb-buffer-pool-size=64M >"$stage/server.log" 2>&1 &
+server_pid=$!
+for attempt in {1..30}; do
+    if mariadb-admin --no-defaults -u root -S "$copy" ping >/dev/null 2>&1; then
+        break
+    fi
+    if ! kill -0 "$server_pid" || [[ $attempt == 30 ]]; then
+        tail -n 25 "$stage/server.log" >&2
+        exit 1
+    fi
+    sleep 1
+done
+# Use a transaction for Kuma's InnoDB data. Include the local account/grant tables.
+mariadb-dump --no-defaults -u root -S "$live" --all-databases --single-transaction \
+    --quick --skip-lock-tables --routines --events --triggers --flush-privileges |
+    mariadb --no-defaults -u root -S "$copy"
+mariadb-check --no-defaults -u root -S "$copy" --check kuma >&2
+mariadb-admin --no-defaults -u root -S "$copy" shutdown
+wait "$server_pid"
+server_pid=
+tar --numeric-owner -C "$stage/db" -cpf - .
+MARIADB
+tar --numeric-owner --same-permissions -C "$work/mariadb" -xpf -
+chown --reference="$kuma_data" "$work/mariadb"
+chmod --reference="$kuma_data" "$work/mariadb"
+
+log "Capturing and checking the CrowdSec SQLite database"
+timeout 3m python3 -I - "$crowdsec_db" "$work/crowdsec.db" <<'PYTHON'
+from contextlib import closing
+from pathlib import Path
+import os
+import sqlite3
+import stat
+import sys
+
+source, target = map(Path, sys.argv[1:])
+with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as original:
+    with closing(sqlite3.connect(target)) as copy:
+        original.backup(copy, pages=256, sleep=0.1)
+        copy.execute("PRAGMA journal_mode=DELETE")
+        if copy.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            raise RuntimeError("CrowdSec SQLite backup failed integrity check")
+
+attrs = source.stat()
+os.chown(target, attrs.st_uid, attrs.st_gid)
+target.chmod(stat.S_IMODE(attrs.st_mode))
+PYTHON
+
+log "Staging the Pi filesystem and boot partition with raspiBackup"
+(
+    cd /
+    raspiBackup.sh -f "$config" -t rsync -m 0 -o : -a : "$work/raspi"
+)
+shopt -s nullglob
+snapshots=("$work"/raspi/*/*-rsync-backup-*)
+[[ ${#snapshots[@]} -eq 1 && -d ${snapshots[0]} ]] || fail "Expected one staged raspiBackup snapshot"
+snapshot=${snapshots[0]}
+for path in "$postgres_data" "$kuma_data" "$crowdsec_db"; do
+    parent="$snapshot${path%/*}"
+    [[ -d $parent && $(realpath -e -- "$parent") == "$parent" &&
+        ! -e "$snapshot$path" && ! -L "$snapshot$path" ]] ||
+        fail "Unexpected staged path for $path"
+done
+mv -T -- "$work/postgres" "$snapshot$postgres_data"
+mv -T -- "$work/mariadb" "$snapshot$kuma_data"
+mv -T -- "$work/crowdsec.db" "$snapshot$crowdsec_db"
+
+name="online-$(date +%Y%m%d-%H%M%S)"
+pending=$(mktemp -d ".${name}.partial.XXXXXXXX")
+log "Writing compressed archive to the UNAS"
+tar --numeric-owner --acls --xattrs --xattrs-include='*' --sparse \
+    -C "${snapshot%/*}" -cpf - "${snapshot##*/}" |
+    zstd -q -T2 -3 -c >"$pending/raspibackup.tar.zst"
+install -m 0600 /usr/local/share/raspibackup-online/RESTORE.txt "$pending/RESTORE.txt"
+install -m 0600 "$config" "$pending/raspibackup-online.conf"
+log "Reading back the archive and verifying the compression checksum and tar structure"
+zstd -q -dc -- "$pending/raspibackup.tar.zst" | tar -tf - >/dev/null
+(cd "$pending" && sha256sum raspibackup.tar.zst >SHA256SUMS)
+sync -f "$pending/raspibackup.tar.zst"
+[[ ! -e $name ]] || fail "Backup destination already exists: $name"
+mv -T -- "$pending" "$name"
+pending=
+sync -f .
+log "Verified backup published: $unas/raspberrypi-online/$name"
+
+# The directory has only this job's generations. Keep the two newest completed archives.
+archives=(online-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9])
+if (( ${#archives[@]} > 2 )); then
+    for old in "${archives[@]:0:${#archives[@]}-2}"; do
+        if [[ -d $old && ! -L $old && -f $old/SHA256SUMS && -f $old/raspibackup.tar.zst ]]; then
+            rm -rf -- "$old"
+        fi
+    done
+fi
+
+# Retire the last legacy disk image after the replacement archives are verified.
+legacy_parent=../raspberrypi
+# Optional migration setting. Use the directory name of an existing legacy dd backup.
+legacy_name=
+legacy="$legacy_parent/$legacy_name"
+if (( ${#archives[@]} >= 2 )) && [[ ${archives[-1]} == "$name" &&
+    $legacy_name =~ ^raspberrypi@[^/]+-dd-backup-[0-9]{8}-[0-9]{6}$ &&
+    -d $legacy && ! -L $legacy && ! -L $legacy_parent ]]; then
+    previous=${archives[-2]}
+    if [[ -d $previous && ! -L $previous && -s $previous/SHA256SUMS ]] &&
+        (cd "$previous" && sha256sum --check --strict SHA256SUMS); then
+        legacy_files=("$legacy"/* "$legacy"/.[!.]* "$legacy"/..?*)
+        legacy_image="$legacy/$legacy_name.img"
+        legacy_log="$legacy/raspiBackup.log"
+        legacy_msg="$legacy/raspiBackup.msg"
+        if [[ ${#legacy_files[@]} -eq 3 &&
+            -f $legacy_image && ! -L $legacy_image &&
+            -f $legacy_log && ! -L $legacy_log &&
+            -f $legacy_msg && ! -L $legacy_msg ]]; then
+            rm -- "$legacy_image" "$legacy_log" "$legacy_msg"
+            rmdir -- "$legacy"
+            log "Retired the legacy disk image after verifying two online archives"
+        fi
+    else
+        log "Preserved the legacy disk image because the previous online archive did not verify"
+    fi
+fi

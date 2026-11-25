@@ -1,0 +1,31 @@
+Raspberry Pi recovery from the UNAS
+
+Each online backup directory contains a compressed raspiBackup rsync snapshot,
+the restore configuration, and a SHA-256 manifest. The snapshot includes boot
+and partition metadata and the application databases at their normal paths.
+
+Work from a separate Linux recovery system with raspiBackup, zstd, GNU tar,
+and enough free space on an ext4 filesystem for the unpacked snapshot. In the
+selected online backup directory, verify the archive with:
+
+  sha256sum -c SHA256SUMS
+
+Extract as root to an empty directory on ext4. Replace /recovery with that
+directory and use the full path to the archive if needed:
+
+  sudo tar --zstd --numeric-owner --acls --xattrs --xattrs-include='*' \
+    -xpf raspibackup.tar.zst -C /recovery
+
+Identify the spare target disk with lsblk. The restore will erase it. Use its
+whole-device path, such as /dev/sdX, and replace SNAPSHOT with the extracted
+directory name. Use raspiBackup 0.7.2 or a compatible version:
+
+  sudo raspiBackup.sh -f "$PWD/raspibackup-online.conf" -d /dev/sdX /recovery/SNAPSHOT
+
+Boot and validate the restored applications with the original Pi isolated or
+powered down to avoid duplicate IP addresses and identities. Check Vikunja,
+Uptime Kuma, and CrowdSec before putting the restored system back in service.
+
+Recreate /etc/raspibackup-alerts/telegram.json from the secured deployment
+after recovery. Online archives exclude the Telegram credential. Check the
+Telegram and failure email routes before relying on completion alerts.

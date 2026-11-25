@@ -1,26 +1,25 @@
-# --- Backups and Images ---
-# Never commit the actual backup files
+# Backup archives, manifests, and working files
 *.dd
 *.ddz
 *.gz
 *.img
 *.iso
-
-# --- raspiBackup logs and temp files ---
-# raspiBackup often creates logs or temporary mount points
+*.zst
 *.log
 *.tmp
-/mnt/*
+SHA256SUMS
+/online-*/
+/.online-*.partial.*/
+/mnt/
+/install
 
-# --- OS Specific ---
+# Local settings and credentials
 .DS_Store
-# For your Ubuntu/Debian nodes
 .bash_history
 .ssh/
-
-# --- Sensitive Info ---
-# If you store your raspiBackup.conf here, ensure it doesn't 
-# contain cleartext passwords for SMB/NFS shares.
-# Use environment variables or a separate secret file.
 .env
+*.local.conf
 secrets.yaml
+smtp-password
+telegram.json
+.telegram.*
